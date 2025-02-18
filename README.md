@@ -1,7 +1,3 @@
-# EVL RID project additional steps
-- sudo setcap cap_net_admin+ep /bin/ip
-- sudo setcap cap_net_admin+ep /usr/sbin/ip
-
 # rtw88 downstream 🐧
 ### This is a downstream repo with a primary purpose of supporting development, testing and maintenance for the Realtek rtw88 series of WiFi 5 drivers in the Linux kernel.
 
