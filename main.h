@@ -191,6 +191,11 @@ extern bool rtw_bf_support;
 extern bool rtw_disable_lps_deep_mode;
 extern unsigned int rtw_debug_mask;
 extern bool rtw_edcca_enabled;
+extern bool rtw_monitor_cck_pd_pin;
+extern bool rtw_monitor_ofdm_rx;
+extern bool rtw_monitor_perch_igi;
+extern bool rtw_monitor_igi_sweep;
+extern uint rtw_monitor_igi_sweep_ms;
 extern const struct ieee80211_ops rtw_ops;
 
 #define RTW_MAX_CHANNEL_NUM_2G 14
@@ -1880,6 +1885,13 @@ struct rtw_dm_info {
 	u8 pre_min_rssi;
 	u16 fa_history[4];
 	u8 igi_history[4];
+	/* RID sniffer: last converged IGI per 2.4 GHz channel (1..14), so a
+	 * hopping monitor restores each channel's own gain instead of
+	 * carrying the previous channel's value. 0 = no history yet.
+	 */
+	u8 igi_by_ch[15];
+	/* RID sniffer: current position of the IGI sweep, 0 = restart at top */
+	u8 igi_sweep_cur;
 	u8 igi_bitmap;
 	bool damping;
 	u8 damping_cnt;
@@ -2234,6 +2246,8 @@ struct rtw_dev {
 
 	/* watch dog every 2 sec */
 	struct delayed_work watch_dog_work;
+	/* RID sniffer: fast IGI sweep for monitor mode (rtw_phy_igi_sweep_work) */
+	struct delayed_work igi_sweep_work;
 	u32 watch_dog_cnt;
 
 	struct list_head rsvd_page_list;

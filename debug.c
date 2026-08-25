@@ -792,6 +792,18 @@ static int rtw_debugfs_get_phy_info(struct seq_file *m, void *v)
 	seq_printf(m, "Current CH(fc) = %u\n", rtwdev->hal.current_channel);
 	seq_printf(m, "Current BW = %u\n", rtwdev->hal.current_band_width);
 	seq_printf(m, "Current IGI = 0x%x\n", dm_info->igi_history[0]);
+	seq_printf(m, "RID: cck_pd_pin=%c ofdm_rx=%c perch_igi=%c sweep=%c/%ums cck_pd_lv=%u rxpsel=0x%08x\n",
+		   rtw_monitor_cck_pd_pin ? 'Y' : 'N',
+		   rtw_monitor_ofdm_rx ? 'Y' : 'N',
+		   rtw_monitor_perch_igi ? 'Y' : 'N',
+		   rtw_monitor_igi_sweep ? 'Y' : 'N',
+		   rtw_monitor_igi_sweep_ms,
+		   dm_info->cck_pd_lv[RTW_CHANNEL_WIDTH_20][RF_PATH_A],
+		   rtw_read32(rtwdev, REG_RXPSEL));
+	seq_puts(m, "RID: igi_by_ch=");
+	for (rate_id = 1; rate_id <= 14; rate_id++)
+		seq_printf(m, "%x%s", dm_info->igi_by_ch[rate_id],
+			   rate_id < 14 ? ";" : "\n");
 	seq_printf(m, "TP {Tx, Rx} = {%u, %u}Mbps\n",
 		   stats->tx_throughput, stats->rx_throughput);
 	seq_printf(m, "1SS for TX and RX = %c\n\n", rtwdev->hal.txrx_1ss ?

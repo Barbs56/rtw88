@@ -35,13 +35,53 @@ EXPORT_SYMBOL(rtw_debug_mask);
  */
 bool rtw_edcca_enabled = true;
 
+/* RID sniffer knobs. Both act only while no station is associated (passive
+ * monitor use); with a link present the stock dynamic mechanisms run
+ * untouched. Both are reconciled from the 2s watchdog, so runtime toggles
+ * and chip re-inits (USB replug, channel hop side effects) self-heal within
+ * one tick.
+ */
+bool rtw_monitor_cck_pd_pin = true;
+EXPORT_SYMBOL(rtw_monitor_cck_pd_pin);
+bool rtw_monitor_ofdm_rx = true;
+EXPORT_SYMBOL(rtw_monitor_ofdm_rx);
+bool rtw_monitor_perch_igi = true;
+EXPORT_SYMBOL(rtw_monitor_perch_igi);
+bool rtw_monitor_igi_sweep;
+EXPORT_SYMBOL(rtw_monitor_igi_sweep);
+uint rtw_monitor_igi_sweep_ms = 50;
+EXPORT_SYMBOL(rtw_monitor_igi_sweep_ms);
+
 module_param_named(disable_lps_deep, rtw_disable_lps_deep_mode, bool, 0644);
 module_param_named(support_bf, rtw_bf_support, bool, 0644);
 module_param_named(debug_mask, rtw_debug_mask, uint, 0644);
+/* monitor_max_gain is a legacy alias for the IGI sweep: the stratux UI
+ * switch and its reconciler write this name, so it must keep existing.
+ * The max-gain pin it originally controlled is gone (real-world tests
+ * showed pinned gain loses to adaptive/swept gain in dense RF).
+ */
+module_param_named(monitor_max_gain, rtw_monitor_igi_sweep, bool, 0644);
+module_param_named(monitor_cck_pd_pin, rtw_monitor_cck_pd_pin, bool, 0644);
+module_param_named(monitor_ofdm_rx, rtw_monitor_ofdm_rx, bool, 0644);
+module_param_named(monitor_perch_igi, rtw_monitor_perch_igi, bool, 0644);
+module_param_named(monitor_igi_sweep, rtw_monitor_igi_sweep, bool, 0644);
+module_param_named(monitor_igi_sweep_ms, rtw_monitor_igi_sweep_ms, uint, 0644);
 
 MODULE_PARM_DESC(disable_lps_deep, "Set Y to disable Deep PS");
 MODULE_PARM_DESC(support_bf, "Set Y to enable beamformee support");
 MODULE_PARM_DESC(debug_mask, "Debugging mask");
+MODULE_PARM_DESC(monitor_max_gain,
+		 "Legacy alias of monitor_igi_sweep (kept for the stratux UI switch)");
+MODULE_PARM_DESC(monitor_cck_pd_pin,
+		 "Keep CCK-PD at most sensitive level (LV0) while unlinked, independent of gain mode (default Y)");
+MODULE_PARM_DESC(monitor_ofdm_rx,
+		 "Set N to disable the OFDM demodulator while unlinked (DSSS/CCK-only RX)");
+MODULE_PARM_DESC(monitor_perch_igi,
+		 "Restore each 2.4 GHz channel's own last IGI on hop while unlinked (default Y)");
+MODULE_PARM_DESC(monitor_igi_sweep,
+		 "Sweep IGI from coverage max down to the floor continuously while unlinked, restarting at the protected end on every channel change (default N)");
+MODULE_PARM_DESC(monitor_igi_sweep_ms,
+		 "IGI sweep step period in milliseconds (default 50)");
 
 static struct ieee80211_channel rtw_channeltable_2g[] = {
 	{.center_freq = 2412, .hw_value = 1,},
@@ -896,6 +936,8 @@ void rtw_set_channel(struct rtw_dev *rtwdev)
 	bandwidth = ch_param.bandwidth;
 	band = ch_param.center_chan > 14 ? RTW_BAND_5G : RTW_BAND_2G;
 
+	rtw_phy_dig_channel_switch(rtwdev, hal->current_channel, center_chan);
+
 	rtw_update_channel(rtwdev, center_chan, primary_chan, band, bandwidth);
 
 	if (rtwdev->scan_info.op_chan)
@@ -1625,6 +1667,8 @@ int rtw_core_start(struct rtw_dev *rtwdev)
 
 	ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->watch_dog_work,
 				     RTW_WATCH_DOG_DELAY_TIME);
+	ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->igi_sweep_work,
+				     msecs_to_jiffies(rtw_monitor_igi_sweep_ms));
 
 	set_bit(RTW_FLAG_RUNNING, rtwdev->flags);
 
@@ -1651,6 +1695,7 @@ void rtw_core_stop(struct rtw_dev *rtwdev)
 	cancel_work_sync(&rtwdev->c2h_work);
 	cancel_work_sync(&rtwdev->update_beacon_work);
 	cancel_delayed_work_sync(&rtwdev->watch_dog_work);
+	cancel_delayed_work_sync(&rtwdev->igi_sweep_work);
 	cancel_delayed_work_sync(&coex->bt_relink_work);
 	cancel_delayed_work_sync(&coex->bt_reenable_work);
 	cancel_delayed_work_sync(&coex->defreeze_work);
@@ -2266,6 +2311,7 @@ int rtw_core_init(struct rtw_dev *rtwdev)
 	}
 
 	INIT_DELAYED_WORK(&rtwdev->watch_dog_work, rtw_watch_dog_work);
+	INIT_DELAYED_WORK(&rtwdev->igi_sweep_work, rtw_phy_igi_sweep_work);
 	INIT_DELAYED_WORK(&coex->bt_relink_work, rtw_coex_bt_relink_work);
 	INIT_DELAYED_WORK(&coex->bt_reenable_work, rtw_coex_bt_reenable_work);
 	INIT_DELAYED_WORK(&coex->defreeze_work, rtw_coex_defreeze_work);

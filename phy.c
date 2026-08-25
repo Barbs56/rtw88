@@ -549,10 +549,26 @@ static void rtw_phy_dig(struct rtw_dev *rtwdev)
 	if (test_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags))
 		return;
 
+	linked = !!rtwdev->sta_cnt;
+
+	/* RID sniffer: hold the gain floor while unlinked. Runs ahead of the
+	 * damping detector so a latched oscillation cannot silently override
+	 * it, and holds the detector in reset so a switch back to stock
+	 * behavior starts from clean history.
+	 */
+	/* RID sniffer: while the IGI sweep owns the register, DIG stands
+	 * aside entirely (the sweep visits every gain state each pass, so
+	 * there is nothing left for an estimator to decide).
+	 */
+	if (!linked && rtw_monitor_igi_sweep) {
+		dm_info->damping = false;
+		dm_info->damping_cnt = 0;
+		dm_info->igi_bitmap = 0;
+		return;
+	}
+
 	if (rtw_phy_dig_check_damping(dm_info))
 		return;
-
-	linked = !!rtwdev->sta_cnt;
 
 	fa_cnt = dm_info->total_fa_cnt;
 	pre_igi = dm_info->igi_history[0];
@@ -806,13 +822,131 @@ static void rtw_phy_cck_pd(struct rtw_dev *rtwdev)
 	rtw_dbg(rtwdev, RTW_DBG_PHY, "cck_fa_avg=%d, cck_pd_default=%d\n",
 		dm_info->cck_fa_avg, dm_info->cck_pd_default);
 
-	level = rtw_phy_cck_pd_lv(rtwdev);
+	/* RID sniffer: RID beacons are 1 Mbps DSSS, gated by this detector's
+	 * own threshold, not by IGI. Its stock back-off (CCK FA avg > 1000)
+	 * is the twitchiest in the chip; hold it at the most sensitive level
+	 * while unlinked. cck_pd_set is idempotent, so forcing it per tick
+	 * is free.
+	 */
+	if (!rtw_is_assoc(rtwdev) && rtw_monitor_cck_pd_pin)
+		level = CCK_PD_LV0;
+	else
+		level = rtw_phy_cck_pd_lv(rtwdev);
 
 	if (level >= CCK_PD_LV_MAX)
 		return;
 
 	if (chip->ops->cck_pd_set)
 		chip->ops->cck_pd_set(rtwdev, level);
+}
+
+/* RID sniffer: DIG samples false alarms over a 2 s window, but a hopping
+ * monitor visits several channels within one window, so stock DIG converges
+ * on a blend of all hopped channels rather than any real one. Remember each
+ * 2.4 GHz channel's last IGI and restore it on tune, so every channel keeps
+ * its own operating point and DIG refines per channel across visits.
+ * Inactive when linked, when the gain pin owns IGI, or on 5 GHz.
+ */
+void rtw_phy_dig_channel_switch(struct rtw_dev *rtwdev, u8 old_ch, u8 new_ch)
+{
+	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
+	u8 igi;
+
+	if (rtwdev->sta_cnt)
+		return;
+	if (test_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags))
+		return;
+
+	/* sweep mode: restart at the protected end on every hop so each
+	 * dwell opens the aperture progressively toward the floor
+	 */
+	if (rtw_monitor_igi_sweep) {
+		dm_info->igi_sweep_cur = DIG_CVRG_MAX;
+		rtw_phy_dig_write(rtwdev, DIG_CVRG_MAX);
+		dm_info->igi_history[0] = DIG_CVRG_MAX;
+		return;
+	}
+
+	if (!rtw_monitor_perch_igi)
+		return;
+
+	if (old_ch >= 1 && old_ch <= 14)
+		dm_info->igi_by_ch[old_ch] = dm_info->igi_history[0];
+
+	if (new_ch < 1 || new_ch > 14 || new_ch == old_ch)
+		return;
+
+	igi = dm_info->igi_by_ch[new_ch];
+	if (!igi || igi == dm_info->igi_history[0])
+		return;
+
+	rtw_phy_dig_write(rtwdev, igi);
+	/* keep DIG's notion of "current IGI" honest without feeding the
+	 * damping detector a fake oscillation pattern
+	 */
+	dm_info->igi_history[0] = igi;
+}
+EXPORT_SYMBOL(rtw_phy_dig_channel_switch);
+
+/* RID sniffer: IGI sweep engine. Instead of estimating the right gain from
+ * false-alarm statistics, raster through the gain axis the same way the
+ * hopper rasters through channels: start each dwell at the protected end
+ * (DIG_CVRG_MAX) and step toward the floor (DIG_CVRG_MIN), so every gain
+ * state is visited on every dwell and the momentarily-optimal one is
+ * guaranteed some listening time. Self-requeues; a cheap no-op when the
+ * mode is off, linked, or the max-gain pin owns the register.
+ */
+void rtw_phy_igi_sweep_work(struct work_struct *work)
+{
+	struct rtw_dev *rtwdev = container_of(work, struct rtw_dev,
+					      igi_sweep_work.work);
+	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
+	uint period = rtw_monitor_igi_sweep_ms;
+	u8 cur;
+
+	if (!period || period > 1000)
+		period = 50;
+
+	if (!rtw_monitor_igi_sweep || rtwdev->sta_cnt ||
+	    !test_bit(RTW_FLAG_RUNNING, rtwdev->flags) ||
+	    test_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags))
+		goto requeue;
+
+	mutex_lock(&rtwdev->mutex);
+	cur = dm_info->igi_sweep_cur;
+	if (cur <= DIG_CVRG_MIN || cur > DIG_CVRG_MAX)
+		cur = DIG_CVRG_MAX;
+	else
+		cur -= 2;
+	dm_info->igi_sweep_cur = cur;
+	rtw_phy_dig_write(rtwdev, cur);
+	dm_info->igi_history[0] = cur;
+	mutex_unlock(&rtwdev->mutex);
+
+requeue:
+	ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->igi_sweep_work,
+				     msecs_to_jiffies(period));
+}
+EXPORT_SYMBOL(rtw_phy_igi_sweep_work);
+
+/* RID sniffer: per-modulation RX enables live in REG_RXPSEL — the driver
+ * itself clears the CCK enable (bit 28) on 5 GHz. Bit 29 is the OFDM
+ * sibling. Clearing it while unlinked makes the receiver DSSS/CCK-only:
+ * it can no longer sync onto (and be occupied by) OFDM router traffic.
+ * Reconciled every watchdog tick so runtime toggles and chip re-inits
+ * self-heal; a link appearing restores stock behavior immediately.
+ */
+static void rtw_phy_monitor_ofdm_rx(struct rtw_dev *rtwdev)
+{
+	bool want = rtw_monitor_ofdm_rx || rtwdev->sta_cnt;
+	bool cur = !!(rtw_read32(rtwdev, REG_RXPSEL) & BIT(29));
+
+	if (want == cur)
+		return;
+
+	rtw_info(rtwdev, "monitor: OFDM RX %s\n",
+		 want ? "enabled" : "disabled");
+	rtw_write32_mask(rtwdev, REG_RXPSEL, BIT(29), want ? 1 : 0);
 }
 
 static void rtw_phy_pwr_track(struct rtw_dev *rtwdev)
@@ -833,6 +967,7 @@ void rtw_phy_dynamic_mechanism(struct rtw_dev *rtwdev)
 	rtw_phy_statistics(rtwdev);
 	rtw_phy_dig(rtwdev);
 	rtw_phy_cck_pd(rtwdev);
+	rtw_phy_monitor_ofdm_rx(rtwdev);
 	rtw_phy_ra_track(rtwdev);
 	rtw_phy_tx_path_diversity(rtwdev);
 	rtw_phy_cfo_track(rtwdev);
