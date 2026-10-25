@@ -1890,8 +1890,15 @@ struct rtw_dm_info {
 	 * carrying the previous channel's value. 0 = no history yet.
 	 */
 	u8 igi_by_ch[15];
-	/* RID sniffer: current position of the IGI sweep, 0 = restart at top */
+	/* RID sniffer: IGI the sweep last wrote */
 	u8 igi_sweep_cur;
+	/* RID sniffer: hop-locked sweep. Jiffies of the current pass start,
+	 * whether that start was a real hop (vs. a fixed-channel restart), and
+	 * the step learned from the measured hop interval (0 = not learned).
+	 */
+	unsigned long igi_sweep_hop;
+	bool igi_sweep_hop_real;
+	unsigned long igi_sweep_step;
 	u8 igi_bitmap;
 	bool damping;
 	u8 damping_cnt;

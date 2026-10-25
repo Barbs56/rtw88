@@ -81,7 +81,7 @@ MODULE_PARM_DESC(monitor_perch_igi,
 MODULE_PARM_DESC(monitor_igi_sweep,
 		 "Sweep IGI from coverage max down to the floor continuously while unlinked, restarting at the protected end on every channel change (default N)");
 MODULE_PARM_DESC(monitor_igi_sweep_ms,
-		 "IGI sweep step period in milliseconds (default 50)");
+		 "IGI sweep step in ms until the hop interval is learned, and on a fixed channel (default 50)");
 
 static struct ieee80211_channel rtw_channeltable_2g[] = {
 	{.center_freq = 2412, .hw_value = 1,},
@@ -956,6 +956,8 @@ void rtw_set_channel(struct rtw_dev *rtwdev)
 	}
 
 	rtw_phy_set_tx_power_level(rtwdev, center_chan);
+
+	rtw_phy_igi_sweep_hop(rtwdev);
 
 	/* if the channel isn't set for scanning, we will do RF calibration
 	 * in ieee80211_ops::mgd_prepare_tx(). Performing the calibration

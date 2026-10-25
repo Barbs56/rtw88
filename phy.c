@@ -857,15 +857,11 @@ void rtw_phy_dig_channel_switch(struct rtw_dev *rtwdev, u8 old_ch, u8 new_ch)
 	if (test_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags))
 		return;
 
-	/* sweep mode: restart at the protected end on every hop so each
-	 * dwell opens the aperture progressively toward the floor
+	/* sweep mode: the pass restarts once the retune has completed, in
+	 * rtw_phy_igi_sweep_hop()
 	 */
-	if (rtw_monitor_igi_sweep) {
-		dm_info->igi_sweep_cur = DIG_CVRG_MAX;
-		rtw_phy_dig_write(rtwdev, DIG_CVRG_MAX);
-		dm_info->igi_history[0] = DIG_CVRG_MAX;
+	if (rtw_monitor_igi_sweep)
 		return;
-	}
 
 	if (!rtw_monitor_perch_igi)
 		return;
@@ -890,22 +886,88 @@ EXPORT_SYMBOL(rtw_phy_dig_channel_switch);
 
 /* RID sniffer: IGI sweep engine. Instead of estimating the right gain from
  * false-alarm statistics, raster through the gain axis the same way the
- * hopper rasters through channels: start each dwell at the protected end
- * (DIG_CVRG_MAX) and step toward the floor (DIG_CVRG_MIN), so every gain
- * state is visited on every dwell and the momentarily-optimal one is
- * guaranteed some listening time. Self-requeues; a cheap no-op when the
- * mode is off, linked, or the max-gain pin owns the register.
+ * hopper rasters through channels. The sweep is locked to the hopper: every
+ * completed retune starts a pass at the protected end (DIG_CVRG_MAX) that
+ * steps to the floor (DIG_CVRG_MIN) and holds it until the next hop. The step
+ * is learned from the measured hop interval so a full pass always fits in a
+ * dwell, whatever the dwell is, with the floor taking the remainder. The gain
+ * is a pure function of time since the hop, so a late or stray worker run
+ * cannot desynchronise the pass.
  */
+#define IGI_SWEEP_STATES	((DIG_CVRG_MAX - DIG_CVRG_MIN) / 2 + 1)
+/* one pass = IGI_SWEEP_STATES steps in IGI_SWEEP_SLOTS steps of dwell */
+#define IGI_SWEEP_SLOTS		(IGI_SWEEP_STATES + 1)
+
+static unsigned long rtw_phy_igi_sweep_step(struct rtw_dm_info *dm_info)
+{
+	uint ms = rtw_monitor_igi_sweep_ms;
+
+	if (dm_info->igi_sweep_step)
+		return dm_info->igi_sweep_step;
+	if (!ms || ms > 1000)
+		ms = 50;
+	return max_t(unsigned long, 1, msecs_to_jiffies(ms));
+}
+
+static void rtw_phy_igi_sweep_set(struct rtw_dev *rtwdev, u8 igi)
+{
+	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
+
+	if (igi == dm_info->igi_sweep_cur)
+		return;
+	rtw_phy_dig_write(rtwdev, igi);
+	dm_info->igi_sweep_cur = igi;
+	dm_info->igi_history[0] = igi;
+}
+
+/* Called with rtwdev->mutex held, after a channel switch has completed. */
+void rtw_phy_igi_sweep_hop(struct rtw_dev *rtwdev)
+{
+	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
+	unsigned long now = jiffies;
+	unsigned long dwell = now - dm_info->igi_sweep_hop;
+	unsigned long step, cur;
+
+	if (!rtw_monitor_igi_sweep || rtwdev->sta_cnt ||
+	    !test_bit(RTW_FLAG_RUNNING, rtwdev->flags) ||
+	    test_bit(RTW_FLAG_DIG_DISABLE, rtwdev->flags))
+		return;
+
+	/* Learn the step from real hop-to-hop intervals only. A shorter dwell
+	 * is adopted at once so the next pass still fits; a longer one is
+	 * approached gradually so one slow hop cannot stretch a pass past the
+	 * following dwell. Intervals over 5 s are a paused hopper, not a dwell.
+	 */
+	if (dm_info->igi_sweep_hop_real && dwell >= IGI_SWEEP_SLOTS &&
+	    dwell <= 5 * HZ) {
+		step = dwell / IGI_SWEEP_SLOTS;
+		cur = dm_info->igi_sweep_step;
+		if (!cur || step < cur)
+			dm_info->igi_sweep_step = step;
+		else
+			dm_info->igi_sweep_step = cur + (step - cur) / 4;
+	}
+	dm_info->igi_sweep_hop = now;
+	dm_info->igi_sweep_hop_real = true;
+
+	dm_info->igi_sweep_cur = 0;
+	rtw_phy_igi_sweep_set(rtwdev, DIG_CVRG_MAX);
+
+	cancel_delayed_work(&rtwdev->igi_sweep_work);
+	ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->igi_sweep_work,
+				     rtw_phy_igi_sweep_step(dm_info));
+}
+EXPORT_SYMBOL(rtw_phy_igi_sweep_hop);
+
 void rtw_phy_igi_sweep_work(struct work_struct *work)
 {
 	struct rtw_dev *rtwdev = container_of(work, struct rtw_dev,
 					      igi_sweep_work.work);
 	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
-	uint period = rtw_monitor_igi_sweep_ms;
-	u8 cur;
-
-	if (!period || period > 1000)
-		period = 50;
+	unsigned long step = rtw_phy_igi_sweep_step(dm_info);
+	unsigned long restart = 2 * IGI_SWEEP_SLOTS * step;
+	unsigned long delay = step;
+	unsigned long elapsed, idx;
 
 	if (!rtw_monitor_igi_sweep || rtwdev->sta_cnt ||
 	    !test_bit(RTW_FLAG_RUNNING, rtwdev->flags) ||
@@ -913,19 +975,28 @@ void rtw_phy_igi_sweep_work(struct work_struct *work)
 		goto requeue;
 
 	mutex_lock(&rtwdev->mutex);
-	cur = dm_info->igi_sweep_cur;
-	if (cur <= DIG_CVRG_MIN || cur > DIG_CVRG_MAX)
-		cur = DIG_CVRG_MAX;
-	else
-		cur -= 2;
-	dm_info->igi_sweep_cur = cur;
-	rtw_phy_dig_write(rtwdev, cur);
-	dm_info->igi_history[0] = cur;
+	elapsed = jiffies - dm_info->igi_sweep_hop;
+	/* No hop for two dwells' worth (fixed channel, or the sweep was just
+	 * enabled): start a new pass so the sweep keeps cycling.
+	 */
+	if (!dm_info->igi_sweep_hop || elapsed >= restart) {
+		dm_info->igi_sweep_hop = jiffies;
+		dm_info->igi_sweep_hop_real = false;
+		elapsed = 0;
+	}
+	idx = elapsed / step;
+	if (idx < IGI_SWEEP_STATES - 1) {
+		rtw_phy_igi_sweep_set(rtwdev, DIG_CVRG_MAX - 2 * idx);
+		delay = step - elapsed % step;
+	} else {
+		rtw_phy_igi_sweep_set(rtwdev, DIG_CVRG_MIN);
+		delay = restart - elapsed;
+	}
 	mutex_unlock(&rtwdev->mutex);
 
 requeue:
 	ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->igi_sweep_work,
-				     msecs_to_jiffies(period));
+				     delay);
 }
 EXPORT_SYMBOL(rtw_phy_igi_sweep_work);
 
